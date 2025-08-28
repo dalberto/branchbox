@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Make scripts executable
+        run: |
+          chmod +x branchbox
+          chmod +x install.sh
+          chmod +x tests/quick.sh
+          chmod +x tests/test-utils.sh
+      
+      - name: Setup Git
+        run: |
+          git config --global user.email "test@example.com"
+          git config --global user.name "Test User"
+      
+      - name: Run tests
+        run: cd tests && ./quick.sh

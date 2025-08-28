@@ -1,0 +1,1138 @@
+#!/bin/bash
+
+set -e
+
+# Script setup
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Configuration
+COPY_ENV_FILES=${BRANCHBOX_COPY_ENV_FILES:-true}  # Copy .env files from main to worktrees by default
+AUTO_SETUP=${BRANCHBOX_AUTO_SETUP:-prompt}  # Run setup scripts: true, false, or prompt
+WORKTREE_SETUP=${BRANCHBOX_WORKTREE_SETUP:-false}  # Run setup in new worktrees
+DEFAULT_SETUP_SCRIPTS=${BRANCHBOX_SETUP_SCRIPTS:-".branchbox-setup.sh:branchbox-setup.sh:setup.sh:init.sh:bootstrap.sh"}
+
+# Detect if script is globally installed or running locally
+# If script is in a directory containing *-branchbox or has worktree structure, it's local
+is_global_install() {
+    local script_parent=$(basename "$SCRIPT_PATH")
+    # Check if script is in a worktrees directory
+    if [[ "$script_parent" =~ -branchbox$ ]]; then
+        return 1  # Not global (is local)
+    fi
+    # Check if script path contains common global locations
+    if [[ "$SCRIPT_PATH" =~ ^/(usr|opt)/(local/)?s?bin$ ]] || [[ "$SCRIPT_PATH" =~ ^$HOME/(bin|.local/bin)$ ]]; then
+        return 0  # Is global
+    fi
+    # Check if current directory has worktree structure
+    for dir in "$SCRIPT_PATH"/*/; do
+        if [ -d "$dir" ]; then
+            local dirname=$(basename "$dir")
+            if [[ "$dirname" =~ ^.+-(main|[^-]+)$ ]]; then
+                return 1  # Not global (has worktree structure)
+            fi
+        fi
+    done
+    return 0  # Assume global
+}
+
+# Find branchbox root directory by looking for marker file
+find_branchbox_root() {
+    local dir="$1"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/.branchbox" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Check if current directory is inside a worktree
+is_in_worktree() {
+    [ -f ".branchbox-worktree" ] || [ -f "../.branchbox-worktree" ]
+}
+
+# Get current worktree name from marker file
+get_current_worktree() {
+    if [ -f ".branchbox-worktree" ]; then
+        cat ".branchbox-worktree" 2>/dev/null || echo ""
+    elif [ -f "../.branchbox-worktree" ]; then
+        cat "../.branchbox-worktree" 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+# Get the working directory for worktrees
+# First check for branchbox marker files, then fall back to old logic
+get_worktrees_dir() {
+    # Check if we're inside a branchbox project (has marker files)
+    local root=$(find_branchbox_root "$(pwd)")
+    if [ -n "$root" ]; then
+        echo "$root"
+        return 0
+    fi
+
+    # Fall back to old logic for compatibility
+    if is_global_install; then
+        echo "$(pwd)"
+    else
+        echo "$SCRIPT_PATH"
+    fi
+}
+
+# Initialize script directory dynamically
+get_script_dir() {
+    get_worktrees_dir
+}
+
+SCRIPT_DIR="$(get_script_dir)"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Find setup script in a directory
+find_setup_script() {
+    local search_dir=$1
+    local scripts="${2:-$DEFAULT_SETUP_SCRIPTS}"
+
+    # Split the colon-separated list of script names
+    IFS=':' read -ra script_array <<< "$scripts"
+
+    for script_name in "${script_array[@]}"; do
+        if [ -f "$search_dir/$script_name" ]; then
+            echo "$search_dir/$script_name"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Find existing compose override file in a directory
+find_compose_override_file() {
+    local search_dir=$1
+
+    # Check for override files in order of preference
+    local override_files=(
+        "compose.override.yaml"
+        "compose.override.yml"
+        "docker-compose.override.yaml"
+        "docker-compose.override.yml"
+    )
+
+    for override_file in "${override_files[@]}"; do
+        if [ -f "$search_dir/$override_file" ]; then
+            echo "$search_dir/$override_file"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Manage compose override file to set project name
+manage_compose_override() {
+    local worktree_dir=$1
+    local project_name=$2
+
+    # Find existing override file or determine new filename
+    local override_file=$(find_compose_override_file "$worktree_dir")
+
+    if [ -z "$override_file" ]; then
+        # No existing override file, create new one with modern naming
+        override_file="$worktree_dir/compose.override.yaml"
+        echo "name: $project_name" > "$override_file"
+        echo -e "${GREEN}Created compose.override.yaml with project name: $project_name${NC}"
+    else
+        # Override file exists, need to update it
+        local temp_file=$(mktemp)
+        local found_name=false
+
+        # Process existing file line by line
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [[ "$line" =~ ^name:[[:space:]]* ]]; then
+                # Replace existing name field
+                echo "name: $project_name" >> "$temp_file"
+                found_name=true
+            else
+                # Keep existing line
+                echo "$line" >> "$temp_file"
+            fi
+        done < "$override_file"
+
+        # If name field wasn't found, add it at the beginning
+        if [ "$found_name" = false ]; then
+            echo "name: $project_name" > "$temp_file.new"
+            cat "$temp_file" >> "$temp_file.new"
+            mv "$temp_file.new" "$temp_file"
+        fi
+
+        # Replace original file
+        mv "$temp_file" "$override_file"
+        echo -e "${GREEN}Updated $(basename "$override_file") with project name: $project_name${NC}"
+    fi
+}
+
+# Run setup script with proper context
+run_setup_script() {
+    local script_path=$1
+    local worktree_name=${2:-main}
+    local is_main=${3:-true}
+
+    if [ ! -f "$script_path" ]; then
+        echo -e "${RED}Error: Setup script not found: $script_path${NC}"
+        return 1
+    fi
+
+    if [ ! -x "$script_path" ]; then
+        echo -e "${YELLOW}Making setup script executable: $script_path${NC}"
+        chmod +x "$script_path"
+    fi
+
+    echo -e "${BLUE}Running setup script: $(basename "$script_path")${NC}"
+
+    # Get project name for context
+    local project_name=$(get_project_name)
+
+    # Run script with context environment variables
+    (
+        export BRANCHBOX_WORKTREE_NAME="$worktree_name"
+        export BRANCHBOX_IS_MAIN="$is_main"
+        export BRANCHBOX_PROJECT_NAME="$project_name"
+        cd "$(dirname "$script_path")"
+        ./$(basename "$script_path")
+    )
+
+    local exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}✓ Setup script completed successfully${NC}"
+    else
+        echo -e "${RED}✗ Setup script failed with exit code: $exit_code${NC}"
+    fi
+
+    return $exit_code
+}
+
+# Prompt user to run setup script
+prompt_setup() {
+    local script_path=$1
+    local context=${2:-"repository"}
+
+    # Show relative path if in worktree, otherwise full path
+    local display_path="$script_path"
+    if [[ "$script_path" =~ /main/ ]]; then
+        display_path="main/$(basename "$script_path")"
+    elif [[ "$script_path" =~ -worktrees/ ]]; then
+        # Extract worktree name and filename
+        local worktree_part="${script_path#*-worktrees/}"
+        display_path="$worktree_part"
+    fi
+
+    echo -e "${YELLOW}Found setup script: $display_path${NC}"
+    echo ""
+    read -p "Run this setup script now? (Y/n) " -n 1 -r
+    echo
+
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo -e "${YELLOW}Skipping setup. You can run it later with: branchbox setup${NC}"
+        return 1
+    fi
+
+    return 0
+}
+
+usage() {
+    local exit_code="${1:-1}"
+    echo "Usage: $SCRIPT_NAME {clone|create|up|down|status|remove|remove-project|setup} [arguments]"
+    echo ""
+    echo "Commands:"
+    echo "  clone <repo-url> [--no-setup]    Clone repository and set up worktree structure"
+    echo "  create <name> [branch]            Create a new worktree (branch defaults to name if omitted)"
+    echo "  up <name> [name2...]              Start Docker services for one or more worktrees"
+    echo "  down <name> [name2...] [--remove|-r]  Stop Docker services for one or more worktrees"
+    echo "                                    Use --remove or -r flag to also delete the worktree"
+    echo "  status                            Show status of all worktrees"
+    echo "  remove <name>                     Remove a worktree and clean up its resources"
+    echo "  remove-project                    Remove entire branchbox project (all worktrees and directory)"
+    echo "  setup [name]                      Run setup script for main or specified worktree"
+    echo ""
+    echo ""
+    echo "Examples:"
+    echo "  # Clone and set up a new project"
+    echo "  $SCRIPT_NAME clone https://github.com/user/repo.git"
+    echo ""
+    echo "  # Create worktree with same name for branch and directory"
+    echo "  $SCRIPT_NAME create feature-auth"
+    echo ""
+    echo "  # Create worktree with different branch name"
+    echo "  $SCRIPT_NAME create auth feature/authentication"
+    echo ""
+    echo "  # Start services for one or more worktrees"
+    echo "  $SCRIPT_NAME up feature-auth"
+    echo "  $SCRIPT_NAME up feature-auth api-v2 bugfix"
+    echo ""
+    echo "  # Stop services without removing worktree"
+    echo "  $SCRIPT_NAME down feature-auth"
+    echo ""
+    echo "  # Stop services and remove worktree"
+    echo "  $SCRIPT_NAME down feature-auth --remove"
+    echo ""
+    echo ""
+    echo "Environment Variables:"
+    echo "  BRANCHBOX_COPY_ENV_FILES - Copy ignored .env files to new worktrees (default: true)"
+    echo "                             Set to 'false' to disable automatic .env file copying"
+    echo "  BRANCHBOX_AUTO_SETUP     - Run setup scripts after clone: true, false, or prompt (default: prompt)"
+    echo "  BRANCHBOX_WORKTREE_SETUP - Run setup scripts in new worktrees (default: false)"
+    echo "  BRANCHBOX_SETUP_SCRIPTS  - Colon-separated list of setup script names to search for"
+    echo "                             Default: '.branchbox-setup.sh:branchbox-setup.sh:setup.sh:init.sh:bootstrap.sh'"
+    echo ""
+    echo "Docker Compose Contract:"
+    echo "  Your docker-compose.yml should be configured to allow multiple instances."
+    echo "  Options include:"
+    echo "    - Use random/dynamic port assignments (ports: \"8000\" instead of \"8000:8000\")"
+    echo "    - Use docker-compose.override.yml for port remapping"
+    echo "    - Configure services to use environment variables for ports"
+    echo ""
+    echo "  BranchBox handles isolation via COMPOSE_PROJECT_NAME and Docker volumes."
+    exit "$exit_code"
+}
+
+# Clone repository and set up worktree structure
+clone_repository() {
+    local repo_url=""
+    local no_setup=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-setup)
+                no_setup=true
+                shift
+                ;;
+            *)
+                if [ -z "$repo_url" ]; then
+                    repo_url=$1
+                else
+                    echo -e "${RED}Error: Unexpected argument: $1${NC}"
+                    usage
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$repo_url" ]; then
+        echo -e "${RED}Error: Repository URL is required${NC}"
+        usage
+    fi
+
+    # Extract project name from URL
+    local project_name=$(basename "$repo_url" .git)
+    echo -e "${BLUE}Using project name: $project_name${NC}"
+
+    # If globally installed and already in a branchbox directory, warn the user
+    if is_global_install; then
+        local current_dir=$(basename "$(pwd)")
+        if [[ "$current_dir" =~ -branchbox$ ]]; then
+            echo -e "${YELLOW}Warning: Already in a branchbox directory: $current_dir${NC}"
+            echo "Consider cloning in the parent directory instead."
+            read -p "Continue anyway? (y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
+        fi
+    fi
+
+    # Validate project name
+    if [[ ! "$project_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo -e "${RED}Error: Project name must contain only letters, numbers, hyphens, and underscores${NC}"
+        exit 1
+    fi
+
+    # Create worktrees directory
+    local worktrees_dir="${project_name}-branchbox"
+    if [ -d "$worktrees_dir" ]; then
+        echo -e "${RED}Error: Directory '$worktrees_dir' already exists${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Creating worktree structure for $project_name...${NC}"
+    mkdir -p "$worktrees_dir"
+
+    # Create branchbox root marker file
+    echo "$project_name" > "$worktrees_dir/.branchbox"
+
+    # Clone the repository as main
+    echo -e "${BLUE}Cloning repository...${NC}"
+    git clone "$repo_url" "$worktrees_dir/main"
+
+    # Create worktree marker in main
+    echo "main" > "$worktrees_dir/main/.branchbox-worktree"
+
+    # Create compose override file for main to set project name
+    manage_compose_override "$worktrees_dir/main" "${project_name}-main"
+
+    # Copy script only if not globally installed
+    if ! is_global_install; then
+        cp "$0" "$worktrees_dir/branchbox"
+        chmod +x "$worktrees_dir/branchbox"
+    fi
+
+    echo -e "${GREEN}✓ Repository cloned and structure created!${NC}"
+    echo ""
+    echo "Structure created:"
+    echo "  $worktrees_dir/"
+    if ! is_global_install; then
+        echo "  ├── branchbox"
+    fi
+    echo "  └── main/"
+    echo ""
+
+    # Check for and run setup script if not disabled
+    if [ "$no_setup" = false ]; then
+        local setup_script=$(find_setup_script "$worktrees_dir/main")
+        if [ -n "$setup_script" ]; then
+            local should_run=false
+
+            case "$AUTO_SETUP" in
+                true)
+                    should_run=true
+                    ;;
+                false)
+                    echo -e "${YELLOW}Setup script found: main/$(basename "$setup_script")${NC}"
+                    echo "AUTO_SETUP is disabled. You can run it later with: branchbox setup"
+                    ;;
+                prompt)
+                    if prompt_setup "$setup_script" "main repository"; then
+                        should_run=true
+                    fi
+                    ;;
+            esac
+
+            if [ "$should_run" = true ]; then
+                run_setup_script "$setup_script" "main" "true"
+            fi
+        fi
+    fi
+    echo ""
+    echo -e "${GREEN}✓ Setup complete!${NC}"
+    echo ""
+    echo -e "${BLUE}Next steps:${NC}"
+    echo -e "  ${YELLOW}cd $(basename "$worktrees_dir")${NC}"
+    echo ""
+    echo "Then you can:"
+    if is_global_install; then
+        echo "  branchbox create <name> [branch]  # Create a new worktree"
+        echo "  branchbox status                  # View all worktrees"
+    else
+        echo "  ./branchbox create <name> [branch]  # Create a new worktree"
+        echo "  ./branchbox status                  # View all worktrees"
+    fi
+    echo ""
+    echo "Note: BranchBox sets COMPOSE_PROJECT_NAME=${project_name}-<worktree> for isolation."
+}
+
+# Get project name from existing structure
+get_project_name() {
+    local base_dir="$SCRIPT_DIR"
+
+    # First check for branchbox marker file
+    if [ -f "$base_dir/.branchbox" ]; then
+        cat "$base_dir/.branchbox" 2>/dev/null
+        return
+    fi
+
+    # Check if we're in a *-branchbox directory (works for both global and local)
+    local current_dir_name=$(basename "$base_dir")
+    if [[ "$current_dir_name" =~ ^(.+)-branchbox$ ]]; then
+        # Extract project name from directory name
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+
+    # Look for main directory first
+    if [ -d "$base_dir/main/.git" ]; then
+        # Extract project name from git remote
+        local remote_url=$(cd "$base_dir/main" && git remote get-url origin 2>/dev/null || echo "")
+        if [ -n "$remote_url" ]; then
+            local project_name=$(basename "$remote_url" .git)
+            echo "$project_name"
+            return
+        fi
+    fi
+
+    # Fallback: look for any git directory
+    for dir in "$base_dir"/*/; do
+        if [ -d "$dir/.git" ] && [ "$(basename "$dir")" != "branchbox" ]; then
+            local remote_url=$(cd "$dir" && git remote get-url origin 2>/dev/null || echo "")
+            if [ -n "$remote_url" ]; then
+                local project_name=$(basename "$remote_url" .git)
+                echo "$project_name"
+                return
+            fi
+        fi
+    done
+    echo ""
+}
+
+# Get actual running ports for all containers in a project
+get_project_ports() {
+    local compose_project=$1
+    for container in $(docker ps --filter "label=com.docker.compose.project=${compose_project}" --format "{{.Names}}"); do
+        local ports=$(docker port "$container" 2>/dev/null)
+        if [ -n "$ports" ]; then
+            echo "    $container:"
+            echo "$ports" | sed 's/^/      /'
+        fi
+    done
+}
+
+# Get the main repository directory
+get_main_repo() {
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        return
+    fi
+
+    # Look for main repository
+    if [ -d "${SCRIPT_DIR}/main" ]; then
+        echo "${SCRIPT_DIR}/main"
+    else
+        # Find first git directory as fallback
+        for dir in "${SCRIPT_DIR}"/*/; do
+            if [ -d "$dir/.git" ]; then
+                echo "$dir"
+                return
+            fi
+        done
+    fi
+}
+
+
+
+# Create a new worktree
+create_worktree() {
+    local name=$1
+    local branch=$2
+
+    if [ -z "$name" ]; then
+        echo -e "${RED}Error: Worktree name is required${NC}"
+        usage
+    fi
+
+    # If branch not specified, use the same as name
+    if [ -z "$branch" ]; then
+        branch="$name"
+        echo -e "${BLUE}Using '$name' as both worktree name and branch name${NC}"
+    fi
+
+    # Get project name
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Could not determine project name${NC}"
+        if is_global_install; then
+            echo "Make sure you're in a branchbox directory (e.g., myproject-branchbox/)"
+        else
+            echo "Are you in the correct branchbox directory?"
+        fi
+        exit 1
+    fi
+
+    local worktree_dir="${SCRIPT_DIR}/${name}"
+
+    # Check for collision
+    if [ -d "$worktree_dir" ]; then
+        echo -e "${RED}Error: Worktree '${name}' already exists${NC}"
+        exit 1
+    fi
+
+    # Find main repository
+    local main_repo=$(get_main_repo)
+    if [ -z "$main_repo" ]; then
+        echo -e "${RED}Error: Could not find main repository${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Creating worktree '$name' for branch '$branch'...${NC}"
+
+    # Create the worktree using git
+    cd "$main_repo"
+
+    # Check if branch exists (locally or remotely)
+    if git show-ref --verify --quiet "refs/heads/$branch" || \
+       git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+        # Branch exists, check it out
+        echo -e "${BLUE}Branch '$branch' exists, checking it out...${NC}"
+        git worktree add "../${name}" "$branch"
+    else
+        # Create new branch
+        echo -e "${BLUE}Creating new branch '$branch'...${NC}"
+        git worktree add -b "$branch" "../${name}"
+    fi
+
+    # Create worktree marker file
+    echo "$name" > "$worktree_dir/.branchbox-worktree"
+
+    # Create compose override file to set project name
+    manage_compose_override "$worktree_dir" "${project_name}-${name}"
+
+    # Copy ignored .env files from main repository if enabled
+    if [ "$COPY_ENV_FILES" = true ]; then
+        echo -e "${BLUE}Copying .env files from main repository...${NC}"
+
+        # Find all ignored .env files in the main repository
+        cd "$main_repo"
+        local env_files=$(git ls-files --ignored --exclude-standard --others '*.env*' 2>/dev/null || true)
+
+        if [ -n "$env_files" ]; then
+            while IFS= read -r env_file; do
+                if [ -f "$env_file" ]; then
+                    # Create directory structure if needed
+                    local target_dir="$worktree_dir/$(dirname "$env_file")"
+                    if [ ! -d "$target_dir" ]; then
+                        mkdir -p "$target_dir"
+                    fi
+
+                    # Copy the file
+                    cp "$env_file" "$worktree_dir/$env_file"
+                    echo "  Copied: $env_file"
+                fi
+            done <<< "$env_files"
+        else
+            echo "  No .env files found to copy"
+        fi
+    fi
+
+    echo -e "${GREEN}✓ Worktree created successfully!${NC}"
+    echo ""
+    echo "Configuration:"
+    echo "  Location: $worktree_dir"
+    echo "  Branch: $branch"
+    echo "  Project: ${project_name}-${name}"
+    if [ "$COPY_ENV_FILES" = true ]; then
+        echo "  Note: .env files have been copied from main repository"
+    fi
+    echo ""
+
+    # Check for and run setup script if enabled for worktrees
+    if [ "$WORKTREE_SETUP" = true ]; then
+        local setup_script=$(find_setup_script "$worktree_dir")
+        if [ -n "$setup_script" ]; then
+            echo -e "${BLUE}Running setup script for worktree...${NC}"
+            run_setup_script "$setup_script" "$name" "false"
+        fi
+    fi
+    echo ""
+    echo -e "${GREEN}✓ Worktree created!${NC}"
+    echo ""
+    echo -e "${BLUE}Next steps:${NC}"
+    echo -e "  ${YELLOW}cd $name${NC}"
+    echo ""
+    echo "Then you can:"
+    if is_global_install; then
+        echo "  branchbox up $name        # Start Docker services"
+    else
+        echo "  ../branchbox up $name    # Start Docker services"
+    fi
+}
+
+# Start services for one or more worktrees
+start_worktrees() {
+    if [ $# -eq 0 ]; then
+        echo -e "${RED}Error: At least one worktree name is required${NC}"
+        usage
+    fi
+
+    # Get project name
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Could not determine project name${NC}"
+        if is_global_install; then
+            echo "Make sure you're in a branchbox directory (e.g., myproject-branchbox/)"
+        fi
+        exit 1
+    fi
+
+    local failed_count=0
+    local success_count=0
+
+    # Process each worktree
+    for name in "$@"; do
+        local worktree_dir="${SCRIPT_DIR}/${name}"
+
+        if [ ! -d "$worktree_dir" ]; then
+            echo -e "${RED}Error: Worktree '$name' does not exist${NC}"
+            ((failed_count++))
+            continue
+        fi
+
+        echo -e "${GREEN}Starting worktree '$name'...${NC}"
+
+        # Start in subshell to avoid environment pollution
+        (
+            cd "$worktree_dir"
+
+            # Set COMPOSE_PROJECT_NAME for isolation
+            export COMPOSE_PROJECT_NAME="${project_name}-${name}"
+
+            # Start Docker Compose
+            docker compose up -d --build
+
+            echo -e "${GREEN}✓ Worktree '$name' is running!${NC}"
+
+            # Show actual running ports
+            local compose_project="${project_name}-${name}"
+            local ports_output=$(get_project_ports "$compose_project")
+            if [ -n "$ports_output" ]; then
+                echo "  Exposed ports:"
+                echo "$ports_output"
+            fi
+        )
+
+        if [ $? -eq 0 ]; then
+            ((success_count++))
+        else
+            ((failed_count++))
+        fi
+        echo ""
+    done
+
+    # Summary
+    if [ $# -gt 1 ]; then
+        echo -e "${BLUE}Summary: $success_count started, $failed_count failed${NC}"
+    fi
+
+    # Exit with error if any failed
+    [ $failed_count -eq 0 ]
+}
+
+# Stop services for one or more worktrees
+stop_worktrees() {
+    # Parse flags
+    local remove_flag=false
+    local worktrees=()
+
+    for arg in "$@"; do
+        case "$arg" in
+            --remove|-r)
+                remove_flag=true
+                ;;
+            *)
+                worktrees+=("$arg")
+                ;;
+        esac
+    done
+
+    if [ ${#worktrees[@]} -eq 0 ]; then
+        echo -e "${RED}Error: At least one worktree name is required${NC}"
+        usage
+    fi
+
+    # Get project name
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Could not determine project name${NC}"
+        if is_global_install; then
+            echo "Make sure you're in a branchbox directory (e.g., myproject-branchbox/)"
+        fi
+        exit 1
+    fi
+
+    local failed_count=0
+    local success_count=0
+
+    # Process each worktree
+    for name in "${worktrees[@]}"; do
+        local worktree_dir="${SCRIPT_DIR}/${name}"
+
+        if [ ! -d "$worktree_dir" ]; then
+            echo -e "${RED}Error: Worktree '$name' does not exist${NC}"
+            ((failed_count++))
+            continue
+        fi
+
+        if [ "$remove_flag" = true ]; then
+            echo -e "${YELLOW}Stopping and removing worktree '$name'...${NC}"
+        else
+            echo -e "${YELLOW}Stopping worktree '$name'...${NC}"
+        fi
+
+        # Stop in subshell to avoid environment pollution
+        (
+            cd "$worktree_dir"
+
+            # Set COMPOSE_PROJECT_NAME for isolation
+            export COMPOSE_PROJECT_NAME="${project_name}-${name}"
+
+            if [ "$remove_flag" = true ]; then
+                # Remove volumes when removing worktree
+                docker compose down -v
+            else
+                docker compose down
+            fi
+        )
+
+        if [ $? -eq 0 ]; then
+            if [ "$remove_flag" = true ]; then
+                # Remove the git worktree
+                local main_repo=$(get_main_repo)
+                if [ -n "$main_repo" ]; then
+                    cd "$main_repo"
+                    # Try normal removal first, only force if necessary
+                    if ! git worktree remove "../${name}" 2>/dev/null; then
+                        # If normal removal fails, force and warn.
+                        echo -e "${YELLOW}Warning: Normal worktree removal failed, using force${NC}"
+                        git worktree remove "../${name}" --force 2>/dev/null || true
+                        # Clean up any abandoned worktree references
+                        git worktree prune
+                    fi
+                fi
+
+                # Remove directory if it still exists
+                if [ -d "$worktree_dir" ]; then
+                    rm -rf "$worktree_dir"
+                fi
+
+                echo -e "${GREEN}✓ Worktree '$name' stopped and removed${NC}"
+            else
+                echo -e "${GREEN}✓ Worktree '$name' stopped${NC}"
+            fi
+            ((success_count++))
+        else
+            ((failed_count++))
+        fi
+        echo ""
+    done
+
+    # Summary
+    if [ ${#worktrees[@]} -gt 1 ]; then
+        echo -e "${BLUE}Summary: $success_count processed, $failed_count failed${NC}"
+    fi
+
+    # Exit with error if any failed
+    [ $failed_count -eq 0 ]
+}
+
+# Remove entire branchbox project (all worktrees and project directory)
+remove_project() {
+    # Get project name
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Could not determine project name${NC}"
+        if is_global_install; then
+            echo "Make sure you're in a branchbox directory (e.g., myproject-branchbox/)"
+        fi
+        exit 1
+    fi
+
+    local project_dir="${SCRIPT_DIR}"
+
+    echo -e "${YELLOW}WARNING: This will remove the entire '${project_name}-branchbox' project including:${NC}"
+    echo "  - All worktrees"
+    echo "  - All Docker containers and volumes"
+    echo "  - The entire project directory: $project_dir"
+    echo ""
+    read -p "Are you sure you want to proceed? Type 'yes' to confirm: " confirmation
+
+    if [ "$confirmation" != "yes" ]; then
+        echo -e "${YELLOW}Aborted. No changes made.${NC}"
+        exit 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Removing all worktrees and Docker resources...${NC}"
+
+    # Stop and remove all worktrees
+    local found=false
+    for dir in "$project_dir"/*; do
+        if [ -d "$dir" ]; then
+            local name=$(basename "$dir")
+
+            # Check if this is a git worktree
+            if [ -f "$dir/.git" ] || [ -d "$dir/.git" ]; then
+                found=true
+                echo -e "${BLUE}Stopping and removing worktree: $name${NC}"
+
+                # Set COMPOSE_PROJECT_NAME for isolation
+                export COMPOSE_PROJECT_NAME="${project_name}-${name}"
+
+                # Stop containers and remove volumes
+                (cd "$dir" && docker compose down -v 2>/dev/null || true)
+
+                # Remove git worktree
+                local main_repo=$(get_main_repo)
+                if [ -n "$main_repo" ]; then
+                    (cd "$main_repo" && git worktree remove "../${name}" --force 2>/dev/null || true)
+                fi
+            fi
+        fi
+    done
+
+    # Prune any abandoned worktree references
+    local main_repo=$(get_main_repo)
+    if [ -n "$main_repo" ]; then
+        (cd "$main_repo" && git worktree prune)
+    fi
+
+    # Remove the entire project directory
+    echo ""
+    echo -e "${YELLOW}Removing project directory...${NC}"
+    cd "$(dirname "$project_dir")"  # Move out of the directory first
+    rm -rf "$project_dir"
+
+    echo -e "${GREEN}✓ Project '${project_name}-branchbox' removed successfully${NC}"
+}
+
+# Remove a worktree completely
+remove_worktree() {
+    local name=$1
+
+    if [ -z "$name" ]; then
+        echo -e "${RED}Error: Worktree name is required${NC}"
+        usage
+    fi
+
+    # Get project name
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Could not determine project name${NC}"
+        if is_global_install; then
+            echo "Make sure you're in a branchbox directory (e.g., myproject-branchbox/)"
+        fi
+        exit 1
+    fi
+
+    local worktree_dir="${SCRIPT_DIR}/${name}"
+
+    if [ ! -d "$worktree_dir" ]; then
+        echo -e "${RED}Error: Worktree '$name' does not exist${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Removing worktree '$name'...${NC}"
+
+    # Stop and remove containers/volumes
+    cd "$worktree_dir"
+
+    # Set COMPOSE_PROJECT_NAME for isolation
+    export COMPOSE_PROJECT_NAME="${project_name}-${name}"
+
+    docker compose down -v 2>/dev/null || true
+
+    # Remove the git worktree
+    local main_repo=$(get_main_repo)
+    if [ -n "$main_repo" ]; then
+        cd "$main_repo"
+        # Try normal removal first, only force if necessary
+        if ! git worktree remove "../${name}" 2>/dev/null; then
+            # If normal removal fails, warn.
+            echo -e "${YELLOW}Warning: Normal worktree removal failed, forcing.${NC}"
+            git worktree remove "../${name}" --force 2>/dev/null || true
+            # Clean up any abandoned worktree references
+            git worktree prune
+        fi
+    fi
+
+    # Remove directory if it still exists
+    if [ -d "$worktree_dir" ]; then
+        rm -rf "$worktree_dir"
+    fi
+
+    echo -e "${GREEN}✓ Worktree '$name' removed successfully${NC}"
+}
+
+# List all worktrees
+list_worktrees() {
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        return
+    fi
+
+    for dir in "$SCRIPT_DIR"/*/; do
+        if [ -d "$dir" ] && [ "$(basename "$dir")" != "branchbox" ]; then
+            local name=$(basename "$dir")
+            echo "  $name"
+        fi
+    done
+}
+
+# Show status of all worktrees
+show_status() {
+    echo -e "${BLUE}=== Worktree Status ===${NC}"
+    echo ""
+
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        if is_global_install; then
+            # Check if we're in a branchbox directory
+            local current_dir=$(basename "$(pwd)")
+            if [[ ! "$current_dir" =~ -branchbox$ ]]; then
+                echo "  Not in a branchbox directory."
+                echo ""
+                echo "  To get started:"
+                echo "    1. Clone a repository: branchbox clone <repo-url>"
+                echo "    2. Or navigate to an existing branchbox directory"
+                echo ""
+                return
+            fi
+        fi
+        echo "  No worktrees found. Start by cloning a repository:"
+        echo "  $SCRIPT_NAME clone <repo-url>"
+        echo ""
+        return
+    fi
+
+    echo "Project: $project_name"
+    echo ""
+
+    local found=false
+    for dir in "$SCRIPT_DIR"/*/; do
+        if [ -d "$dir" ] && [ "$(basename "$dir")" != "branchbox" ]; then
+            found=true
+            local name=$(basename "$dir")
+            local branch="unknown"
+
+            # Get branch name
+            if [ -f "$dir/.git" ] || [ -d "$dir/.git" ]; then
+                branch=$(cd "$dir" && git branch --show-current 2>/dev/null || echo "detached")
+            fi
+
+            # Check if running
+            local status="${RED}stopped${NC}"
+            local compose_project="${project_name}-${name}"
+            if docker ps --format '{{.Names}}' | grep -q "^${compose_project}"; then
+                status="${GREEN}running${NC}"
+            fi
+
+            # Get ports if running
+            local ports=""
+            local first_container=$(docker ps --filter "label=com.docker.compose.project=${compose_project}" --format "{{.Names}}" | head -1)
+            if [ -n "$first_container" ]; then
+                local container_ports=$(docker port "$first_container" 2>/dev/null | head -1 | sed 's/.*://')
+                [ -n "$container_ports" ] && ports="→ :${container_ports}..."
+            fi
+
+            echo -e "  ${YELLOW}$name${NC}: $status (branch: $branch) $ports"
+        fi
+    done
+
+    if [ "$found" = false ]; then
+        echo "  No worktrees found"
+        echo ""
+        echo "  Create one with: $SCRIPT_NAME create <name> [branch]"
+    fi
+    echo ""
+}
+
+# Run setup script for a worktree
+run_setup_command() {
+    local name=$1
+
+    # Get project name
+    local project_name=$(get_project_name)
+    if [ -z "$project_name" ]; then
+        echo -e "${RED}Error: Could not determine project name${NC}"
+        if is_global_install; then
+            echo "Make sure you're in a branchbox directory (e.g., myproject-branchbox/)"
+        fi
+        exit 1
+    fi
+
+    # Determine which worktree to run setup in
+    local worktree_dir=""
+    local worktree_name=""
+    local is_main="false"
+
+    if [ -z "$name" ]; then
+        # No name specified, try main first, then current directory
+        if [ -d "${SCRIPT_DIR}/main" ]; then
+            worktree_dir="${SCRIPT_DIR}/main"
+            worktree_name="main"
+            is_main="true"
+            echo -e "${BLUE}Running setup for main repository${NC}"
+        elif [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ]; then
+            worktree_dir="$(pwd)"
+            worktree_name=$(basename "$(pwd)")
+            echo -e "${BLUE}Running setup in current directory: $worktree_name${NC}"
+        else
+            echo -e "${RED}Error: No worktree name specified and not in a valid worktree directory${NC}"
+            echo "Usage: $SCRIPT_NAME setup [worktree-name]"
+            exit 1
+        fi
+    else
+        # Specific worktree requested
+        worktree_dir="${SCRIPT_DIR}/${name}"
+        worktree_name="$name"
+        if [ "$name" = "main" ]; then
+            is_main="true"
+        fi
+
+        if [ ! -d "$worktree_dir" ]; then
+            echo -e "${RED}Error: Worktree '$name' does not exist${NC}"
+            exit 1
+        fi
+
+        echo -e "${BLUE}Running setup for worktree: $name${NC}"
+    fi
+
+    # Find and run setup script
+    local setup_script=$(find_setup_script "$worktree_dir")
+    if [ -n "$setup_script" ]; then
+        run_setup_script "$setup_script" "$worktree_name" "$is_main"
+    else
+        echo -e "${YELLOW}No setup script found in: $worktree_dir${NC}"
+        echo "Looked for: ${DEFAULT_SETUP_SCRIPTS//:/, }"
+        echo ""
+        echo "To create a setup script, add one of these files to your repository:"
+        echo "  - .branchbox-setup.sh (recommended)"
+        echo "  - setup.sh"
+        echo "  - init.sh"
+        echo "  - bootstrap.sh"
+        exit 1
+    fi
+}
+
+# Main script logic
+case "$1" in
+    --help|-h|help)
+        usage 0
+        ;;
+    clone)
+        shift
+        clone_repository "$@"
+        ;;
+    create)
+        create_worktree "$2" "$3"
+        ;;
+    up|start)
+        shift
+        start_worktrees "$@"
+        ;;
+    down|stop)
+        shift
+        stop_worktrees "$@"
+        ;;
+    status|list|ls)
+        show_status
+        ;;
+    remove|rm|delete)
+        remove_worktree "$2"
+        ;;
+    remove-project)
+        remove_project
+        ;;
+    setup)
+        run_setup_command "$2"
+        ;;
+    *)
+        usage
+        ;;
+esac

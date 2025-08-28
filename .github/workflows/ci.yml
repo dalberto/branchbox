@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  quick-tests:
+    name: Quick Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: |
+          chmod +x branchbox
+          chmod +x install.sh
+          chmod +x tests/quick.sh
+          chmod +x tests/comprehensive.sh
+          chmod +x tests/test-utils.sh
+
+      - name: Setup Git
+        run: |
+          git config --global user.email "test@example.com"
+          git config --global user.name "Test User"
+
+      - name: Run quick tests
+        run: |
+          cd tests
+          ./quick.sh
+
+  comprehensive-tests:
+    name: Comprehensive Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: |
+          chmod +x branchbox
+          chmod +x install.sh
+          chmod +x tests/quick.sh
+          chmod +x tests/comprehensive.sh
+          chmod +x tests/test-utils.sh
+
+      - name: Setup Git
+        run: |
+          git config --global user.email "test@example.com"
+          git config --global user.name "Test User"
+
+      - name: Run comprehensive tests
+        run: |
+          cd tests
+          ./comprehensive.sh --verbose
+
+  shellcheck:
+    name: Shell Script Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          check_together: 'yes'
+          scandir: '.'
+          severity: 'error'
+
+  test-installation:
+    name: Test Installation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: |
+          chmod +x branchbox
+          chmod +x install.sh
+
+      - name: Test local installation
+        run: |
+          INSTALL_DIR=/tmp/test-install ./install.sh --local
+          /tmp/test-install/branchbox --help
+
+      - name: Verify installation
+        run: |
+          if [ ! -f /tmp/test-install/branchbox ]; then
+            echo "Installation failed: branchbox not found"
+            exit 1
+          fi
+          /tmp/test-install/branchbox --help
