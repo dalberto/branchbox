@@ -3,7 +3,7 @@
 [![Tests](https://github.com/dalberto/branchbox/actions/workflows/badge.yml/badge.svg)](https://github.com/dalberto/branchbox/actions/workflows/badge.yml)
 [![CI](https://github.com/dalberto/branchbox/actions/workflows/ci.yml/badge.svg)](https://github.com/dalberto/branchbox/actions/workflows/ci.yml)
 
-Run multiple branches of your Docker Compose project simultaneously with automatic isolation.
+Git worktree management with optional Docker Compose integration for running multiple branches simultaneously.
 
 ## Quick Start
 
@@ -24,11 +24,17 @@ branchbox up feature-auth
 
 ## What It Does
 
-BranchBox manages Git worktrees with Docker Compose isolation:
-- **Separate containers/volumes** per branch via docker compose projects, and `COMPOSE_PROJECT_NAME`.
-- **Preserves .env files** from main branch (API keys, secrets)
-- **Shows actual ports** of running services
-- **No port management** - your project handles that (see [Docker Setup](DOCKER_SETUP.md))
+BranchBox is a Git worktree manager that:
+- **Creates isolated worktrees** for different branches in separate directories
+- **Automatically detects Docker Compose** and enables container isolation when available
+- **Works without Docker** - pure Git worktree management for projects without containers
+- **Preserves .env files** from main branch (API keys, secrets) when creating new worktrees
+- **Shows service status** including actual ports when Docker is available
+
+**Docker Integration (Optional):**
+- **Automatic detection** - enables Docker features only when compose files are present
+- **Container isolation** per branch via `COMPOSE_PROJECT_NAME`
+- **Port conflict handling** - your project manages ports (see [Docker Setup](DOCKER_SETUP.md))
 
 *Security Note: BranchBox copies existing .env files between worktrees by default.*
 
@@ -57,23 +63,25 @@ The install script supports:
 ```bash
 branchbox clone <repo-url> [--no-setup]  # Clone and setup project
 branchbox create <name> [branch]         # Create worktree
-branchbox up <name>                      # Start services
-branchbox down <name> [--remove]         # Stop services (optionally remove)
-branchbox status                         # Show all worktrees
+branchbox up <name>                      # Start services (if Docker available)
+branchbox down <name> [--remove]         # Stop services (if Docker available) 
+branchbox status                         # Show all worktrees with Docker status
 branchbox remove <name>                  # Remove worktree
 branchbox setup [name]                   # Run setup script for main or specified worktree
 ```
 
-## Docker Compose Requirements
+## Docker Support (Optional)
 
-Your project must handle port conflicts. See [DOCKER_SETUP.md](DOCKER_SETUP.md) for strategies.
+BranchBox automatically detects Docker Compose files and enables container features when available. For projects without Docker, BranchBox works as a pure Git worktree manager.
+
+**For Docker projects:** Your compose files must handle port conflicts when running multiple worktrees simultaneously. See [DOCKER_SETUP.md](DOCKER_SETUP.md) for strategies.
 
 Basic example:
 ```yaml
 services:
   web:
     ports:
-      - "${APP_PORT:-8000}:8000"  # Use env var with default
+      - "8000"  # Let Docker assign random ports, or use env vars
 ```
 
 ## Directory Structure
@@ -85,23 +93,33 @@ myproject-branchbox/
 └── bugfix-api/        # Another branch
 ```
 
-BranchBox sets `COMPOSE_PROJECT_NAME=myproject-feature-auth` when running services.
+When Docker is available, BranchBox sets `COMPOSE_PROJECT_NAME=myproject-feature-auth` for container isolation.
 
 ## Common Workflows
 
-### Multiple Features
+### Docker Projects
 ```bash
 branchbox create auth
 branchbox create new-api
-branchbox up auth     # Shows actual ports
-branchbox up new-api  # Different ports
+branchbox up auth     # Start containers, shows ports
+branchbox up new-api  # Start containers on different ports
+branchbox down auth --remove  # Stop and cleanup
+```
+
+### Git-Only Projects  
+```bash
+branchbox create feature-auth
+branchbox create bugfix-db
+branchbox status      # Shows "git-only" status
+# Work directly in directories - no Docker commands needed
+cd feature-auth && npm start  # or whatever your project uses
 ```
 
 ### PR Review
 ```bash
 branchbox create pr-123
-branchbox up pr-123
-# Test the PR...
+branchbox up pr-123   # Starts containers if Docker project
+# Test the PR in isolated environment...
 branchbox down pr-123 --remove
 ```
 
@@ -147,9 +165,38 @@ Setup scripts receive these environment variables:
 ## Environment Variables
 
 - `BRANCHBOX_COPY_ENV_FILES` - Copy .env files to worktrees (default: true)
-- `BRANCHBOX_AUTO_SETUP` - Run setup after clone: true, false, or prompt (default: prompt)
+- `BRANCHBOX_AUTO_SETUP` - Run setup after clone: true, false, or prompt (default: prompt)  
 - `BRANCHBOX_WORKTREE_SETUP` - Run setup in new worktrees (default: false)
 - `BRANCHBOX_SETUP_SCRIPTS` - Colon-separated list of setup script names to search for
+- `BRANCHBOX_DOCKER_ENABLED` - Docker support: auto, true, or false (default: auto)
+
+**Docker Control:**
+- `auto` - Enable Docker only when compose files are detected and Docker is available
+- `true` - Force Docker features even without compose files (useful for debugging)
+- `false` - Disable Docker features entirely (pure Git worktree mode)
+
+## Git-Only Mode
+
+BranchBox works perfectly without Docker! For non-containerized projects, it provides:
+- Git worktree creation and management
+- Branch isolation in separate directories  
+- Environment file copying between worktrees
+- Setup script execution
+- Status reporting
+
+Example workflow:
+```bash
+# Clone any Git repository
+branchbox clone https://github.com/user/my-app.git
+
+# Create worktrees for different features
+branchbox create feature-auth
+branchbox create bugfix-db
+
+# Work directly in worktree directories
+cd feature-auth
+# ... make changes, commit, etc.
+```
 
 ## Testing
 
