@@ -34,7 +34,8 @@ BranchBox is a Git worktree manager that:
 **Docker Integration (Optional):**
 - **Automatic detection** - enables Docker features only when compose files are present
 - **Container isolation** per branch via `COMPOSE_PROJECT_NAME`
-- **Port conflict handling** - your project manages ports (see [Docker Setup](DOCKER_SETUP.md))
+- **Automatic port conflict resolution** - built-in Port Doctor fixes hardcoded port conflicts
+- **Smart port assignment** - deterministic port mapping for consistent worktree access
 
 *Security Note: BranchBox copies existing .env files between worktrees by default.*
 
@@ -68,13 +69,16 @@ branchbox down <name> [--remove]         # Stop services (if Docker available)
 branchbox status                         # Show all worktrees with Docker status
 branchbox remove <name>                  # Remove worktree
 branchbox setup [name]                   # Run setup script for main or specified worktree
+branchbox doctor [--fix|--check] [dir]   # Detect and resolve Docker port conflicts
 ```
 
 ## Docker Support (Optional)
 
 BranchBox automatically detects Docker Compose files and enables container features when available. For projects without Docker, BranchBox works as a pure Git worktree manager.
 
-**For Docker projects:** Your compose files must handle port conflicts when running multiple worktrees simultaneously. See [DOCKER_SETUP.md](DOCKER_SETUP.md) for strategies.
+**Port Conflict Resolution:** BranchBox includes a built-in Port Doctor that automatically detects and resolves port conflicts in Docker Compose files. When creating worktrees with hardcoded ports like `"8080:8080"`, it will offer to create override files with deterministic port assignments.
+
+**Manual port strategies** are also supported - see [DOCKER_SETUP.md](DOCKER_SETUP.md) for detailed configuration options.
 
 Basic example:
 ```yaml
@@ -121,6 +125,18 @@ branchbox create pr-123
 branchbox up pr-123   # Starts containers if Docker project
 # Test the PR in isolated environment...
 branchbox down pr-123 --remove
+```
+
+### Port Conflict Management
+```bash
+# Check for port conflicts
+branchbox doctor --check
+
+# Auto-fix conflicts with override files
+branchbox doctor --fix
+
+# Port Doctor runs automatically during worktree creation
+branchbox create api-v2  # Will offer to fix conflicts if detected
 ```
 
 ## Setup Scripts

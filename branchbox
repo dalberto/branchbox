@@ -246,7 +246,7 @@ prompt_setup() {
 
 usage() {
     local exit_code="${1:-1}"
-    echo "Usage: $SCRIPT_NAME {clone|create|up|down|status|remove|remove-project|setup} [arguments]"
+    echo "Usage: $SCRIPT_NAME {clone|create|up|down|status|remove|remove-project|setup|doctor} [arguments]"
     echo ""
     echo "Commands:"
     echo "  clone <repo-url> [--no-setup]    Clone repository and set up worktree structure"
@@ -258,6 +258,7 @@ usage() {
     echo "  remove <name>                     Remove a worktree and clean up its resources"
     echo "  remove-project                    Remove entire branchbox project (all worktrees and directory)"
     echo "  setup [name]                      Run setup script for main or specified worktree"
+    echo "  doctor [--fix|--check] [dir]      Detect and resolve Docker port conflicts between worktrees"
     echo ""
     echo ""
     echo "Examples:"
@@ -279,6 +280,12 @@ usage() {
     echo ""
     echo "  # Stop services and remove worktree"
     echo "  $SCRIPT_NAME down feature-auth --remove"
+    echo ""
+    echo "  # Check for Docker port conflicts"
+    echo "  $SCRIPT_NAME doctor --check"
+    echo ""
+    echo "  # Auto-fix port conflicts"  
+    echo "  $SCRIPT_NAME doctor --fix"
     echo ""
     echo ""
     echo "Environment Variables:"
@@ -589,6 +596,31 @@ create_worktree() {
     # Check Docker support for informational message
     if is_docker_enabled_for_dir "$worktree_dir"; then
         echo -e "${GREEN}Docker support enabled for this worktree${NC}"
+        
+        # Check for port conflicts and offer to run port doctor
+        if [ -f "$SCRIPT_PATH/scripts/branchbox-port-doctor.sh" ]; then
+            local compose_file=$(find_compose_files "$worktree_dir")
+            if [ -n "$compose_file" ]; then
+                # Check if there are hardcoded ports that would cause conflicts
+                if "$SCRIPT_PATH/scripts/docker-compose-parser.sh" "$compose_file" check >/dev/null 2>&1; then
+                    echo ""
+                    echo -e "${YELLOW}⚠️  Port conflicts detected in Docker Compose configuration${NC}"
+                    echo "Multiple worktrees with hardcoded ports may conflict when running simultaneously."
+                    echo ""
+                    read -p "Run Port Doctor to auto-resolve conflicts? (Y/n) " -n 1 -r
+                    echo
+                    
+                    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                        echo ""
+                        "$SCRIPT_PATH/scripts/branchbox-port-doctor.sh" --fix "$worktree_dir"
+                        echo ""
+                    else
+                        echo -e "${YELLOW}Skipped port conflict resolution${NC}"
+                        echo "You can run 'branchbox doctor' later to resolve conflicts."
+                    fi
+                fi
+            fi
+        fi
     else
         echo -e "${YELLOW}No Docker Compose files found - worktree will run in Git-only mode${NC}"
     fi
@@ -690,6 +722,23 @@ start_worktrees() {
         # Check if Docker is enabled for this worktree
         if is_docker_enabled_for_dir "$worktree_dir"; then
             echo -e "${GREEN}Starting Docker services for worktree '$name'...${NC}"
+            
+            # Check for port conflicts before starting services
+            if [ -f "$SCRIPT_PATH/scripts/branchbox-port-doctor.sh" ]; then
+                local compose_file=$(find_compose_files "$worktree_dir")
+                if [ -n "$compose_file" ]; then
+                    # Check if there are hardcoded ports and no override file exists
+                    if "$SCRIPT_PATH/scripts/docker-compose-parser.sh" "$compose_file" check >/dev/null 2>&1; then
+                        local override_file="$worktree_dir/docker-compose.override.yml"
+                        if [ ! -f "$override_file" ]; then
+                            echo -e "${YELLOW}⚠️  Warning: Hardcoded ports detected without override file${NC}"
+                            echo "This may cause port conflicts with other running worktrees."
+                            echo "Consider running 'branchbox doctor --fix' to resolve conflicts."
+                            echo ""
+                        fi
+                    fi
+                fi
+            fi
 
             # Start in subshell to avoid environment pollution
             (
@@ -1156,6 +1205,26 @@ run_setup_command() {
     fi
 }
 
+# Run port doctor to resolve Docker port conflicts
+run_doctor_command() {
+    # Find the port doctor script
+    local doctor_script="$SCRIPT_PATH/scripts/branchbox-port-doctor.sh"
+    
+    if [ ! -f "$doctor_script" ]; then
+        echo -e "${RED}Error: Port doctor script not found: $doctor_script${NC}"
+        echo "Make sure you're running from the correct branchbox directory."
+        exit 1
+    fi
+    
+    if [ ! -x "$doctor_script" ]; then
+        echo -e "${RED}Error: Port doctor script is not executable: $doctor_script${NC}"
+        exit 1
+    fi
+    
+    # Pass all arguments to the port doctor script
+    "$doctor_script" "$@"
+}
+
 # Main script logic
 case "$1" in
     --help|-h|help)
@@ -1187,6 +1256,10 @@ case "$1" in
         ;;
     setup)
         run_setup_command "$2"
+        ;;
+    doctor)
+        shift
+        run_doctor_command "$@"
         ;;
     *)
         usage

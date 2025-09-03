@@ -13,11 +13,56 @@ Before creating worktrees, ensure your main repository is properly configured:
 
 BranchBox automatically sets `COMPOSE_PROJECT_NAME` for each worktree, ensuring complete isolation of containers, networks, and volumes between worktrees. You don't need to configure this—it just works.
 
-The main challenge you need to solve is **port conflicts** when running multiple worktrees simultaneously.
+## Port Conflict Resolution
 
-## Port Management Strategies
+**NEW**: BranchBox includes a built-in Port Doctor that automatically detects and resolves port conflicts when running multiple worktrees simultaneously.
 
-### Strategy 1: Random Port Assignment (Simplest)
+### Automatic Port Doctor (Recommended)
+
+When you create a worktree with hardcoded ports, BranchBox will automatically detect conflicts and offer to create override files:
+
+```bash
+branchbox create feature-auth
+# ⚠️  Port conflicts detected in Docker Compose configuration
+# Multiple worktrees with hardcoded ports may conflict when running simultaneously.
+# Run Port Doctor to auto-resolve conflicts? (Y/n)
+```
+
+The Port Doctor creates deterministic port assignments:
+- `feature-auth` → ports 8080→8134, 5432→5486, 3000→3054
+- `api-v2` → ports 8080→8089, 5432→5441, 3000→3009
+- Same worktree name always gets same ports (deterministic hashing)
+
+### Manual Port Doctor Usage
+
+```bash
+# Check for conflicts
+branchbox doctor --check
+
+# Auto-fix with override files  
+branchbox doctor --fix
+
+# Interactive mode (default)
+branchbox doctor
+```
+
+The Port Doctor generates `docker-compose.override.yml` files like:
+```yaml
+# Auto-generated docker-compose.override.yml for worktree: feature-auth
+services:
+  web:
+    ports: !override
+      - "8134:80"
+  database:
+    ports: !override
+      - "5486:5432"
+```
+
+### Manual Port Strategies (Alternative)
+
+If you prefer manual control over port assignments, here are alternative strategies:
+
+#### Strategy 1: Random Port Assignment (Simplest)
 
 Let Docker automatically assign random available ports:
 
@@ -46,7 +91,7 @@ docker compose port database 5432  # Shows actual host port for database
 **Pros:** Zero configuration required  
 **Cons:** Ports change on each restart; requires port lookup
 
-### Strategy 2: Override File with Random Ports
+#### Strategy 2: Override File with Random Ports
 
 Create a `docker-compose.override.yml` file that lets Docker assign random ports:
 
@@ -74,11 +119,11 @@ You have two options:
 **Pros:** Simple configuration file approach; can be version controlled if desired  
 **Cons:** Still requires port lookup; manual creation for each worktree if not checked in
 
-### Strategy 3: Automated Port Assignment with Git Hooks
+#### Strategy 3: Automated Port Assignment with Git Hooks
 
 Automatically generate random ports for each worktree using git hooks.
 
-#### Step 1: Prepare docker-compose.yml
+##### Step 1: Prepare docker-compose.yml
 
 Use environment variables with defaults:
 
@@ -98,7 +143,7 @@ services:
       - "${FRONTEND_PORT:-3000}:3000"
 ```
 
-#### Step 2: Create Port Generation Script
+##### Step 2: Create Port Generation Script
 
 Create `scripts/generate-worktree-ports.sh`:
 
@@ -136,7 +181,7 @@ fi
 
 Make it executable: `chmod +x scripts/generate-worktree-ports.sh`
 
-#### Step 3: Set Up Git Hook
+##### Step 3: Set Up Git Hook
 
 **Option A: Local Git Hook**
 
@@ -163,7 +208,7 @@ post-checkout:
 
 Then team members run `lefthook install` once to set up hooks.
 
-#### Step 4: Update .gitignore
+##### Step 4: Update .gitignore
 
 Add to `.gitignore` (since these are auto-generated per worktree):
 

@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# BranchBox Test Suite
+# BranchBox Test Suite  
 # Comprehensive tests with descriptive error messages
+# Includes Port Doctor tests
 
 set -e
 set -o pipefail
@@ -827,6 +828,25 @@ main() {
     printf "" # Force flush
     run_test "invalid-project-name" test_invalid_project_name
     run_test "duplicate-worktree" test_duplicate_worktree
+    
+    # Port Doctor tests
+    echo ""
+    echo -e "${BOLD}${MAGENTA}Port Doctor Tests${NC}"
+    echo "-----------------"
+    printf "" # Force flush
+    # Run the dedicated port doctor test suite
+    if [ -f "$SCRIPT_DIR/port-doctor.sh" ]; then
+        echo "Running dedicated Port Doctor test suite..."
+        if "$SCRIPT_DIR/port-doctor.sh"; then
+            echo -e "${GREEN}✓ Port Doctor test suite passed${NC}"
+        else
+            echo -e "${RED}✗ Port Doctor test suite failed${NC}"
+            ((FAILED_TESTS++))
+        fi
+        ((TOTAL_TESTS++))
+    else
+        echo -e "${YELLOW}⚠ Port Doctor test suite not found${NC}"
+    fi
     
     # Cleanup
     cleanup_test_environment

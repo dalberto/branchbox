@@ -85,6 +85,22 @@ main() {
         print_message "$GREEN" "Copying local ${SCRIPT_NAME} to ${INSTALL_DIR}..."
         cp "./${SCRIPT_NAME}" "${INSTALL_DIR}/${SCRIPT_NAME}"
         
+        # Check if scripts directory exists and copy it
+        if [ -d "./scripts" ]; then
+            print_message "$GREEN" "Copying scripts directory..."
+            # Create scripts directory relative to install location
+            local scripts_target="${INSTALL_DIR}/../branchbox-scripts"
+            mkdir -p "$scripts_target"
+            cp -r "./scripts"/* "$scripts_target/"
+            chmod +x "$scripts_target"/*.sh
+            
+            # Update the branchbox script to use the correct scripts path
+            sed -i.bak "s|SCRIPT_PATH=\"\$(cd \"\$(dirname \"\${BASH_SOURCE\[0\]}\")\" \&\& pwd)\"|SCRIPT_PATH=\"${scripts_target%/*}\"|" "${INSTALL_DIR}/${SCRIPT_NAME}"
+            rm "${INSTALL_DIR}/${SCRIPT_NAME}.bak"
+            
+            print_message "$GREEN" "✓ Port Doctor scripts installed to ${scripts_target}"
+        fi
+        
     else
         # Download from GitHub
         # Try using gh CLI first (if available and authenticated)
@@ -105,6 +121,22 @@ main() {
             TEMP_DIR=$(mktemp -d)
             git clone --depth 1 "git@github.com:${GITHUB_REPO}.git" "$TEMP_DIR"
             cp "$TEMP_DIR/${SCRIPT_NAME}" "${INSTALL_DIR}/${SCRIPT_NAME}"
+            
+            # Install scripts if they exist
+            if [ -d "$TEMP_DIR/scripts" ]; then
+                print_message "$GREEN" "Installing Port Doctor scripts..."
+                local scripts_target="${INSTALL_DIR}/../branchbox-scripts"
+                mkdir -p "$scripts_target"
+                cp -r "$TEMP_DIR/scripts"/* "$scripts_target/"
+                chmod +x "$scripts_target"/*.sh
+                
+                # Update the branchbox script to use the correct scripts path
+                sed -i.bak "s|SCRIPT_PATH=\"\$(cd \"\$(dirname \"\${BASH_SOURCE\[0\]}\")\" \&\& pwd)\"|SCRIPT_PATH=\"${scripts_target%/*}\"|" "${INSTALL_DIR}/${SCRIPT_NAME}"
+                rm "${INSTALL_DIR}/${SCRIPT_NAME}.bak" 2>/dev/null || true
+                
+                print_message "$GREEN" "✓ Port Doctor scripts installed to ${scripts_target}"
+            fi
+            
             rm -rf "$TEMP_DIR"
         else
             print_message "$RED" "Error: Unable to access private repository."
